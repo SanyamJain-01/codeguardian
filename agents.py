@@ -79,5 +79,5 @@ def quality_review(patches, standards_text):
             # guardrail: only rules we retrieved, only lines this PR added; anything else is dropped
             if it.get("rule") in picked and line in added:
                 found.append({"tool": "quality", "rule": it["rule"], "severity": "LOW", "file": file,
-                              "line": line, "message": str(it.get("message", "")), "fix": str(it.get("fix", ""))}) 
+                              "line": line, "message": str(it.get("message", "")), "fix": str(it.get("fix", ""))})
     return found

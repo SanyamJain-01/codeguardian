@@ -203,7 +203,28 @@ def gh(method, path, **kw):
     return r.json()
 
 
+def set_status(repo, sha, state, text):
+    """Show CodeGuardian as a check on the commit. Best effort: a missing token permission must not stop the review."""
+    try:
+        gh("POST", f"/repos/{repo}/statuses/{sha}",
+           json={"state": state, "context": "CodeGuardian", "description": text[:140]})
+    except Exception as e:
+        log.warning("Could not set commit status: %s", e)
+
+
 def review(repo, number, clone_url, sha):
+    set_status(repo, sha, "pending", "Reviewing...")
+    try:
+        state, text = run_review(repo, number, clone_url, sha)
+    except Exception:
+        set_status(repo, sha, "error", "Review failed, see the CodeGuardian logs")
+        raise
+    if state:
+        set_status(repo, sha, state, text)
+
+
+def run_review(repo, number, clone_url, sha):
+    """Scan, run both agents, post or update the comment. Returns the (state, description) for the commit check."""
     # ponytail: first 100 changed files only; paginate if PRs get bigger
     pr_files = [f for f in gh("GET", f"/repos/{repo}/pulls/{number}/files", params={"per_page": 100})
                 if f["status"] != "removed"]
@@ -213,13 +234,22 @@ def review(repo, number, clone_url, sha):
     with tempfile.TemporaryDirectory() as root:
         # fetch just the PR's latest commit, not the whole history
         url = clone_url.replace("https://", f"https://x-access-token:{TOKEN}@")
-        for cmd in (["git", "init", "-q"],
-                    ["git", "fetch", "-q", "--depth", "1", url, sha],
-                    ["git", "checkout", "-q", "FETCH_HEAD"]):
-            subprocess.run(cmd, cwd=root, check=True, capture_output=True, timeout=300)
+        try:
+            for cmd in (["git", "init", "-q"],
+                        ["git", "fetch", "-q", "--depth", "1", url, sha],
+                        ["git", "checkout", "-q", "FETCH_HEAD"]):
+                subprocess.run(cmd, cwd=root, check=True, capture_output=True, timeout=300)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # the git error contains the URL with the token in it; never let it reach the logs
+            raise RuntimeError(f"could not fetch commit {sha[:7]}") from None
         own = Path(root) / "CODING_STANDARDS.md"  # a repo can bring its own standards; otherwise use ours
         r = GRAPH.invoke({"root": root, "files": files, "patches": patches, "errors": [],
                           "standards": (own if own.exists() else agents.STANDARDS).read_text()})
+
+    # two quick pushes = two reviews racing; if a newer commit arrived meanwhile, its review owns the comment
+    if gh("GET", f"/repos/{repo}/pulls/{number}")["head"]["sha"] != sha:
+        log.info("PR #%s moved past %s; dropping this stale review", number, sha[:7])
+        return None, ""
 
     body = report(r["security"], r["notes"], r["quality"], r["errors"])
     comments = gh("GET", f"/repos/{repo}/issues/{number}/comments", params={"per_page": 100})
@@ -229,6 +259,13 @@ def review(repo, number, clone_url, sha):
     else:
         gh("POST", f"/repos/{repo}/issues/{number}/comments", json={"body": body})
     log.info("Reviewed PR #%s: %d security, %d standards", number, len(r["security"]), len(r["quality"]))
+
+    # the check fails only on high-severity security findings the LLM didn't mark as false positives
+    blocking = [f for i, f in enumerate(r["security"])
+                if RANK.get(f["severity"], 3) == 0 and not r["notes"].get(i, {}).get("false_positive")]
+    if blocking:
+        return "failure", f"{len(blocking)} high-severity security issue(s)"
+    return "success", f"{len(r['security'])} security, {len(r['quality'])} standards issue(s), none blocking"
 
 
 @app.post("/webhook")
