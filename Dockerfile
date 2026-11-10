@@ -16,5 +16,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py agents.py CODING_STANDARDS.md ./
 
+# PR code is untrusted: never handle it as root
+RUN useradd --create-home app
+USER app
+
 # hosting platforms set $PORT; default to 8000 locally
 CMD ["sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]

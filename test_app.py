@@ -77,7 +77,9 @@ def fake_github(monkeypatch, head_sha, security=()):
         if path.endswith("/files"):
             return [{"filename": "a.py", "status": "added", "patch": ""}]
         if path.endswith("/pulls/7"):
-            return {"head": {"sha": head_sha}}
+            return {"head": {"sha": head_sha}, "base": {"ref": "main"}}
+        if "/contents/" in path:
+            return {"content": ""}
         return []
 
     result = {"security": list(security), "notes": {}, "quality": [], "errors": []}

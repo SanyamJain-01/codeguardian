@@ -258,11 +258,27 @@ def checkout(root, clone_url, sha):
         raise RuntimeError(f"could not fetch commit {sha[:7]}") from None
 
 
-def analyse(root, files, patches):
-    """Run all agents on a checked-out commit."""
-    own = Path(root) / "CODING_STANDARDS.md"  # a repo can bring its own standards; otherwise use ours
-    return GRAPH.invoke({"root": root, "files": files, "patches": patches, "errors": [],
-                         "standards": (own if own.exists() else agents.STANDARDS).read_text()})
+def inside(root, file):
+    """True if file is a regular file in the checkout. A PR can add a symlink to /proc/self/environ or the
+    server's own files; following it could leak secrets into an LLM prompt or a fix PR."""
+    path, base = Path(root) / file, Path(root).resolve()
+    return not path.is_symlink() and path.resolve().is_relative_to(base)
+
+
+def standards_for(repo, base_ref):
+    """Coding standards from the PR's target branch, so a PR can't rewrite the rules it is judged by."""
+    try:
+        data = gh("GET", f"/repos/{repo}/contents/CODING_STANDARDS.md", params={"ref": base_ref})
+        return base64.b64decode(data["content"]).decode()
+    except httpx.HTTPStatusError:  # the repo has no standards file: use ours
+        return agents.STANDARDS.read_text()
+
+
+def analyse(root, files, patches, standards):
+    """Run all agents on a checked-out commit, on its regular files only."""
+    files = [f for f in files if inside(root, f)]
+    patches = {f: p for f, p in patches.items() if inside(root, f)}
+    return GRAPH.invoke({"root": root, "files": files, "patches": patches, "errors": [], "standards": standards})
 
 
 def review(repo, number, clone_url, sha):
@@ -277,11 +293,13 @@ def review(repo, number, clone_url, sha):
 
 
 def run_review(repo, number, clone_url, sha):
-    """Scan, run both agents, post or update the comment. Returns the (state, description) for the commit check."""
+    """Scan, run all agents, post or update the comment. Returns the (state, description) for the commit check."""
+    pr = gh("GET", f"/repos/{repo}/pulls/{number}")
+    standards = standards_for(repo, pr["base"]["ref"])
     files, patches = pr_inputs(repo, number)
     with tempfile.TemporaryDirectory() as root:
         checkout(root, clone_url, sha)
-        r = analyse(root, files, patches)
+        r = analyse(root, files, patches, standards)
 
     # two quick pushes = two reviews racing; if a newer commit arrived meanwhile, its review owns the comment
     if gh("GET", f"/repos/{repo}/pulls/{number}")["head"]["sha"] != sha:
@@ -343,10 +361,14 @@ def run_fix(repo, number):
         return comment(repo, number, "CodeGuardian can only open fix PRs for branches in this repository, not forks.")
     sha, branch = pr["head"]["sha"], pr["head"]["ref"]
     files, patches = pr_inputs(repo, number)
-    changes, notes = {}, []
+    changes = {}
     with tempfile.TemporaryDirectory() as root:
         checkout(root, pr["head"]["repo"]["clone_url"], sha)
-        r = analyse(root, files, patches)  # fresh findings for exactly this commit
+        r = analyse(root, files, patches, standards_for(repo, pr["base"]["ref"]))  # fresh findings, this commit
+        # a file holding a secret never goes to the LLM: the fix is to remove and rotate the secret
+        secret_files = {f["file"] for f in r["security"] if f["tool"] == "gitleaks"}
+        notes = [f"- `{f}`: contains a secret, so it was not sent to the LLM. Remove the secret and rotate it."
+                 for f in sorted(secret_files)]
         issues = {}
         for i, f in enumerate(r["security"]):
             if not r["notes"].get(i, {}).get("false_positive"):
@@ -354,6 +376,8 @@ def run_fix(repo, number):
         for q in r["quality"]:
             issues.setdefault(q["file"], []).append(q)
         for file, found in issues.items():
+            if file in secret_files:
+                continue
             old = (Path(root) / file).read_text(errors="ignore")
             if len(old) > 20_000:  # ponytail: whole-file rewrites only; big files need diff-based fixes
                 notes.append(f"- `{file}`: skipped, file too large for an automatic fix")
@@ -364,6 +388,8 @@ def run_fix(repo, number):
                 changes[file] = new
             notes.append(f"- `{file}`: {'fixed' if ok else 'not changed'}, {why}")
         for file, names in r.get("untested", {}).items():
+            if file in secret_files:
+                continue
             test = agents.draft_tests(file, changes.get(file) or (Path(root) / file).read_text(), names)
             try:
                 compile(test, "test.py", "exec")
@@ -371,6 +397,8 @@ def run_fix(repo, number):
                 notes.append(f"- `{file}`: drafted tests did not parse, left out")
                 continue
             path = f"tests/test_{Path(file).stem}.py"
+            if (Path(root) / path).exists():  # never overwrite tests someone already wrote
+                path = f"tests/test_{Path(file).stem}_codeguardian.py"
             changes[path] = test
             notes.append(f"- `{path}`: drafted tests for " + ", ".join(f"`{n}`" for n in names))
     if not changes:
