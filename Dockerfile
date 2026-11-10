@@ -14,7 +14,7 @@ RUN python -m venv /opt/semgrep && /opt/semgrep/bin/pip install --no-cache-dir s
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
+COPY app.py agents.py CODING_STANDARDS.md ./
 
 # hosting platforms set $PORT; default to 8000 locally
 CMD ["sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]

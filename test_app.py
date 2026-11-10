@@ -1,22 +1,12 @@
-import json
 import hashlib
 import hmac
+import json
+import secrets
 
 from fastapi.testclient import TestClient
-import secrets
+
+import agents
 import app
-
-
-def test_signature(monkeypatch):
-    monkeypatch.setattr(app, "SECRET", b"s3cret")
-    client = TestClient(app.app)
-    body = b'{"action":"opened"}'
-    good = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
-
-    assert client.post("/webhook", content=body, headers={"X-Hub-Signature-256": "sha256=bad"}).status_code == 401
-    assert client.post("/webhook", content=body, headers={"X-Hub-Signature-256": good}).status_code == 200
-
-
 
 VULN = '''import sqlite3, subprocess
 def get_user(name):
@@ -24,6 +14,15 @@ def get_user(name):
 def run(cmd):
     return subprocess.call(cmd, shell=True)
 '''
+
+
+def test_signature(monkeypatch):
+    monkeypatch.setattr(app, "SECRET", b"s3cret")
+    client = TestClient(app.app)
+    body = b'{"action":"opened"}'
+    good = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+    assert client.post("/webhook", content=body, headers={"X-Hub-Signature-256": "sha256=bad"}).status_code == 401
+    assert client.post("/webhook", content=body, headers={"X-Hub-Signature-256": good}).status_code == 200
 
 
 def test_scan(tmp_path):
@@ -40,25 +39,12 @@ def test_scan(tmp_path):
     assert any(f["line"] == 5 for f in found), "shell=True missed"
     assert len({(f["file"], f["line"]) for f in found}) == len(found), "duplicates not merged"
 
+
 def test_report_escapes_and_lists_errors():
     f = {"tool": "bandit", "rule": "B608", "severity": "MEDIUM", "file": "a.py", "line": 3, "message": "sql"}
-    body = app.report([f], {0: {"risk": "a | b", "fix": "use params", "false_positive": True}}, ["semgrep: Timeout"])
+    body = app.report([f], {0: {"risk": "a | b", "fix": "use params", "false_positive": True}}, [], ["semgrep: Timeout"])
     assert body.startswith(app.MARK)
     assert "(likely false positive) a \\| b" in body and "use params" in body and "Not run: semgrep" in body
-
-
-def test_triage_drops_invented_findings(monkeypatch, tmp_path):
-    (tmp_path / "a.py").write_text("x = 1\n")
-    f = {"tool": "bandit", "rule": "B1", "severity": "LOW", "file": "a.py", "line": 1, "message": "m"}
-    fake = {"items": [{"id": 0, "risk": "r", "fix": "x"}, {"id": 99, "risk": "invented"}]}
-
-    class Resp:
-        def raise_for_status(self): pass
-        def json(self): return {"choices": [{"message": {"content": json.dumps(fake)}}]}
-
-    monkeypatch.setattr(app, "LLM_KEY", "k")
-    monkeypatch.setattr(app.httpx, "post", lambda *a, **k: Resp())
-    assert list(app.triage(str(tmp_path), [f])) == [0]  # id 99 was never sent, so it's dropped
 
 
 def test_pr_event_schedules_review(monkeypatch):
@@ -72,3 +58,11 @@ def test_pr_event_schedules_review(monkeypatch):
                                  headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request"})
     assert r.status_code == 200
     assert calls == [("o/r", 7, "https://github.com/o/r.git", "abc")]
+
+
+def test_triage_drops_invented_findings(monkeypatch, tmp_path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    f = {"tool": "bandit", "rule": "B1", "severity": "LOW", "file": "a.py", "line": 1, "message": "m"}
+    monkeypatch.setattr(agents, "LLM_KEY", "k")
+    monkeypatch.setattr(agents, "llm_json", lambda p: {"items": [{"id": 0, "risk": "r", "fix": "x"}, {"id": 99, "risk": "invented"}]})
+    assert list(app.triage(str(tmp_path), [f])) == [0]  # id 99 was never sent, so it's dropped
