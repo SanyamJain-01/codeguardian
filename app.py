@@ -1,4 +1,5 @@
-"""CodeGuardian: reviews each PR with a security agent and a coding-standards agent, posts one comment."""
+"""CodeGuardian: three agents review each PR and post one comment; "/codeguardian fix" opens a fix PR."""
+import base64
 import hashlib
 import hmac
 import json
@@ -121,7 +122,7 @@ def triage(root, findings):
     return {n["id"]: n for n in notes if isinstance(n.get("id"), int) and 0 <= n["id"] < len(items)}
 
 
-# ---------- the two agents, run in parallel by LangGraph ----------
+# ---------- the three agents, run in parallel by LangGraph ----------
 
 class Review(TypedDict, total=False):
     root: str
@@ -131,7 +132,8 @@ class Review(TypedDict, total=False):
     security: list
     notes: dict
     quality: list
-    errors: Annotated[list, operator.add]  # both agents add errors; LangGraph joins the two lists
+    untested: dict
+    errors: Annotated[list, operator.add]  # several agents add errors; LangGraph joins the lists
 
 
 def security_agent(s):
@@ -152,14 +154,20 @@ def quality_agent(s):
         return {"quality": [], "errors": [f"quality: {e}"[:150]]}
 
 
-# START fans out to both agents in parallel; the review is ready when both reach END
+def test_gap_agent(s):
+    """Lists new public functions that no test mentions. Deterministic: no LLM until someone asks for a fix."""
+    try:
+        return {"untested": agents.untested_functions(s["patches"], s["root"])}
+    except Exception as e:
+        return {"untested": {}, "errors": [f"test-gap: {e}"[:150]]}
+
+
+# START fans out to all agents in parallel; the review is ready when all reach END
 graph = StateGraph(Review)
-graph.add_node("security", security_agent)
-graph.add_node("quality", quality_agent)
-graph.add_edge(START, "security")
-graph.add_edge(START, "quality")
-graph.add_edge("security", END)
-graph.add_edge("quality", END)
+for name, agent in (("security", security_agent), ("quality", quality_agent), ("tests", test_gap_agent)):
+    graph.add_node(name, agent)
+    graph.add_edge(START, name)
+    graph.add_edge(name, END)
 GRAPH = graph.compile()
 
 
@@ -170,7 +178,7 @@ def cell(s):
     return str(s).replace("|", "\\|").replace("\n", " ")[:300]
 
 
-def report(findings, notes, quality, errors):
+def report(findings, notes, quality, errors, untested=None):
     if findings:
         rows = ["| Severity | Location | Rule | Issue | Fix |", "|---|---|---|---|---|"]
         for i, f in enumerate(findings):
@@ -189,6 +197,12 @@ def report(findings, notes, quality, errors):
             rows.append("| " + " | ".join(cell(x) for x in (
                 f"`{q['file']}:{q['line']}`", q["rule"], q["message"], q["fix"])) + " |")
         body += f"\n\n### Coding standards: {len(quality)} issue(s)\n\n" + "\n".join(rows)
+    if untested:
+        body += "\n\n### New functions without tests\n\n" + "\n".join(
+            f"- `{file}`: " + ", ".join(f"`{n}`" for n in names) for file, names in untested.items())
+    if findings or quality or untested:
+        body += ("\n\nComment `/codeguardian fix` to get a pull request with checked fixes and drafted tests. "
+                 "Nothing is merged without your approval.")
     if errors:
         body += "\n\n<sub>Not run: " + "; ".join(errors) + "</sub>"
     return f"{MARK}\n## CodeGuardian review\n\n{body}"
@@ -212,6 +226,39 @@ def set_status(repo, sha, state, text):
         log.warning("Could not set commit status: %s", e)
 
 
+def comment(repo, number, text):
+    gh("POST", f"/repos/{repo}/issues/{number}/comments", json={"body": text})
+
+
+def pr_inputs(repo, number):
+    """(changed file names, {file: diff}) for a PR."""
+    # ponytail: first 100 changed files only; paginate if PRs get bigger
+    pr_files = [f for f in gh("GET", f"/repos/{repo}/pulls/{number}/files", params={"per_page": 100})
+                if f["status"] != "removed"]
+    # ponytail: quality agent makes one LLM call per file, so cap at 10 files to stay in Groq's free limits
+    return [f["filename"] for f in pr_files], {f["filename"]: f.get("patch", "") for f in pr_files[:10]}
+
+
+def checkout(root, clone_url, sha):
+    """Fetch just one commit into root, not the whole history."""
+    url = clone_url.replace("https://", f"https://x-access-token:{TOKEN}@")
+    try:
+        for cmd in (["git", "init", "-q"],
+                    ["git", "fetch", "-q", "--depth", "1", url, sha],
+                    ["git", "checkout", "-q", "FETCH_HEAD"]):
+            subprocess.run(cmd, cwd=root, check=True, capture_output=True, timeout=300)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        # the git error contains the URL with the token in it; never let it reach the logs
+        raise RuntimeError(f"could not fetch commit {sha[:7]}") from None
+
+
+def analyse(root, files, patches):
+    """Run all agents on a checked-out commit."""
+    own = Path(root) / "CODING_STANDARDS.md"  # a repo can bring its own standards; otherwise use ours
+    return GRAPH.invoke({"root": root, "files": files, "patches": patches, "errors": [],
+                         "standards": (own if own.exists() else agents.STANDARDS).read_text()})
+
+
 def review(repo, number, clone_url, sha):
     set_status(repo, sha, "pending", "Reviewing...")
     try:
@@ -225,33 +272,17 @@ def review(repo, number, clone_url, sha):
 
 def run_review(repo, number, clone_url, sha):
     """Scan, run both agents, post or update the comment. Returns the (state, description) for the commit check."""
-    # ponytail: first 100 changed files only; paginate if PRs get bigger
-    pr_files = [f for f in gh("GET", f"/repos/{repo}/pulls/{number}/files", params={"per_page": 100})
-                if f["status"] != "removed"]
-    files = [f["filename"] for f in pr_files]
-    # ponytail: quality agent makes one LLM call per file, so cap at 10 files to stay in Groq's free limits
-    patches = {f["filename"]: f.get("patch", "") for f in pr_files[:10]}
+    files, patches = pr_inputs(repo, number)
     with tempfile.TemporaryDirectory() as root:
-        # fetch just the PR's latest commit, not the whole history
-        url = clone_url.replace("https://", f"https://x-access-token:{TOKEN}@")
-        try:
-            for cmd in (["git", "init", "-q"],
-                        ["git", "fetch", "-q", "--depth", "1", url, sha],
-                        ["git", "checkout", "-q", "FETCH_HEAD"]):
-                subprocess.run(cmd, cwd=root, check=True, capture_output=True, timeout=300)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            # the git error contains the URL with the token in it; never let it reach the logs
-            raise RuntimeError(f"could not fetch commit {sha[:7]}") from None
-        own = Path(root) / "CODING_STANDARDS.md"  # a repo can bring its own standards; otherwise use ours
-        r = GRAPH.invoke({"root": root, "files": files, "patches": patches, "errors": [],
-                          "standards": (own if own.exists() else agents.STANDARDS).read_text()})
+        checkout(root, clone_url, sha)
+        r = analyse(root, files, patches)
 
     # two quick pushes = two reviews racing; if a newer commit arrived meanwhile, its review owns the comment
     if gh("GET", f"/repos/{repo}/pulls/{number}")["head"]["sha"] != sha:
         log.info("PR #%s moved past %s; dropping this stale review", number, sha[:7])
         return None, ""
 
-    body = report(r["security"], r["notes"], r["quality"], r["errors"])
+    body = report(r["security"], r["notes"], r["quality"], r["errors"], r.get("untested"))
     comments = gh("GET", f"/repos/{repo}/issues/{number}/comments", params={"per_page": 100})
     old = next((c for c in comments if c["body"].startswith(MARK)), None)
     if old:  # edit our comment on each push instead of adding a new one
@@ -266,6 +297,97 @@ def run_review(repo, number, clone_url, sha):
     if blocking:
         return "failure", f"{len(blocking)} high-severity security issue(s)"
     return "success", f"{len(r['security'])} security, {len(r['quality'])} standards issue(s), none blocking"
+
+
+# ---------- "/codeguardian fix": a fix PR that a human must approve ----------
+
+def verify_fix(root, file, old, new):
+    """(ok, reason). A fix is kept only if it parses and the scanners agree it made things better, not worse."""
+    if not new.strip() or new == old:
+        return False, "no change suggested"
+    if file.endswith(".py"):
+        try:
+            compile(new, file, "exec")
+        except SyntaxError as e:
+            return False, f"suggested code does not parse (line {e.lineno})"
+    path = Path(root) / file
+    before = len(scan(root, [file])[0])
+    path.write_text(new)
+    after = len(scan(root, [file])[0])
+    path.write_text(old)
+    if after > before:
+        return False, f"scanners found more issues after the change ({before} to {after})"
+    if before and after == before:
+        return False, "scanners still report the same issues"
+    return True, f"scanner findings {before} to {after}"
+
+
+def fix_pr(repo, number):
+    try:
+        run_fix(repo, number)
+    except Exception:
+        comment(repo, number, "CodeGuardian could not prepare fixes this time. See the CodeGuardian logs.")
+        raise
+
+
+def run_fix(repo, number):
+    """Draft fixes and tests, keep only verified ones, open a PR into this PR's branch. Never merges anything."""
+    pr = gh("GET", f"/repos/{repo}/pulls/{number}")
+    if pr["head"]["repo"]["full_name"] != repo:
+        return comment(repo, number, "CodeGuardian can only open fix PRs for branches in this repository, not forks.")
+    sha, branch = pr["head"]["sha"], pr["head"]["ref"]
+    files, patches = pr_inputs(repo, number)
+    changes, notes = {}, []
+    with tempfile.TemporaryDirectory() as root:
+        checkout(root, pr["head"]["repo"]["clone_url"], sha)
+        r = analyse(root, files, patches)  # fresh findings for exactly this commit
+        issues = {}
+        for i, f in enumerate(r["security"]):
+            if not r["notes"].get(i, {}).get("false_positive"):
+                issues.setdefault(f["file"], []).append(f)
+        for q in r["quality"]:
+            issues.setdefault(q["file"], []).append(q)
+        for file, found in issues.items():
+            old = (Path(root) / file).read_text(errors="ignore")
+            if len(old) > 20_000:  # ponytail: whole-file rewrites only; big files need diff-based fixes
+                notes.append(f"- `{file}`: skipped, file too large for an automatic fix")
+                continue
+            new = agents.draft_fix(file, old, found)
+            ok, why = verify_fix(root, file, old, new)
+            if ok:
+                changes[file] = new
+            notes.append(f"- `{file}`: {'fixed' if ok else 'not changed'}, {why}")
+        for file, names in r.get("untested", {}).items():
+            test = agents.draft_tests(file, changes.get(file) or (Path(root) / file).read_text(), names)
+            try:
+                compile(test, "test.py", "exec")
+            except SyntaxError:
+                notes.append(f"- `{file}`: drafted tests did not parse, left out")
+                continue
+            path = f"tests/test_{Path(file).stem}.py"
+            changes[path] = test
+            notes.append(f"- `{path}`: drafted tests for " + ", ".join(f"`{n}`" for n in names))
+    if not changes:
+        return comment(repo, number, "CodeGuardian found nothing it could fix safely:\n\n" + "\n".join(notes))
+
+    fix_branch = f"codeguardian/fix-{number}-{sha[:7]}"
+    try:
+        gh("POST", f"/repos/{repo}/git/refs", json={"ref": f"refs/heads/{fix_branch}", "sha": sha})
+    except httpx.HTTPStatusError:
+        return comment(repo, number, f"A fix branch for this commit already exists: `{fix_branch}`.")
+    for path, content in changes.items():
+        try:  # updating an existing file needs its current blob sha; new files don't
+            current = gh("GET", f"/repos/{repo}/contents/{path}", params={"ref": fix_branch})["sha"]
+        except httpx.HTTPStatusError:
+            current = None
+        gh("PUT", f"/repos/{repo}/contents/{path}", json={
+            "message": f"CodeGuardian: {path}", "branch": fix_branch,
+            "content": base64.b64encode(content.encode()).decode(), **({"sha": current} if current else {})})
+    fix = gh("POST", f"/repos/{repo}/pulls", json={
+        "title": f"CodeGuardian fixes for #{number}", "head": fix_branch, "base": branch,
+        "body": "Suggested by CodeGuardian. Review every change before merging.\n\n" + "\n".join(notes) +
+                "\n\nDrafted tests were not run: CodeGuardian never executes code from a pull request."})
+    comment(repo, number, f"Opened {fix['html_url']} with suggested fixes. It merges into `{branch}` only if you approve it.")
 
 
 @app.post("/webhook")
@@ -283,4 +405,12 @@ async def webhook(request: Request, bg: BackgroundTasks,
             and pr.get("head", {}).get("repo")):  # head repo is gone if the fork was deleted
         bg.add_task(review, payload["repository"]["full_name"], payload["number"],
                     pr["head"]["repo"]["clone_url"], pr["head"]["sha"])
+
+    note = payload.get("comment") or {}
+    if (x_github_event == "issue_comment" and payload.get("action") == "created"
+            and "pull_request" in (payload.get("issue") or {})  # comments on PRs, not plain issues
+            and note.get("body", "").strip().lower().startswith("/codeguardian fix")
+            # only people with write access can ask for a fix branch
+            and note.get("author_association") in {"OWNER", "MEMBER", "COLLABORATOR"}):
+        bg.add_task(fix_pr, payload["repository"]["full_name"], payload["issue"]["number"])
     return {"ok": True}  # GitHub gives up after 10s, so the review runs after we reply
