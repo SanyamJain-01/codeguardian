@@ -1,3 +1,4 @@
+import json
 import hashlib
 import hmac
 
@@ -38,3 +39,22 @@ def test_scan(tmp_path):
     assert any(f["line"] == 3 for f in found), "SQL injection missed"
     assert any(f["line"] == 5 for f in found), "shell=True missed"
     assert len({(f["file"], f["line"]) for f in found}) == len(found), "duplicates not merged"
+
+def test_report_escapes_and_lists_errors():
+    f = {"tool": "bandit", "rule": "B608", "severity": "MEDIUM", "file": "a.py", "line": 3, "message": "a | b"}
+    body = app.report([f], ["semgrep: Timeout"])
+    assert body.startswith(app.MARK)
+    assert "a \\| b" in body and "Not run: semgrep" in body
+
+
+def test_pr_event_schedules_review(monkeypatch):
+    monkeypatch.setattr(app, "SECRET", b"s3cret")
+    calls = []
+    monkeypatch.setattr(app, "review", lambda *a: calls.append(a))
+    body = json.dumps({"action": "opened", "number": 7, "repository": {"full_name": "o/r"},
+                       "pull_request": {"head": {"sha": "abc", "repo": {"clone_url": "https://github.com/o/r.git"}}}}).encode()
+    sig = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+    r = TestClient(app.app).post("/webhook", content=body,
+                                 headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request"})
+    assert r.status_code == 200
+    assert calls == [("o/r", 7, "https://github.com/o/r.git", "abc")]
