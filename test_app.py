@@ -41,10 +41,24 @@ def test_scan(tmp_path):
     assert len({(f["file"], f["line"]) for f in found}) == len(found), "duplicates not merged"
 
 def test_report_escapes_and_lists_errors():
-    f = {"tool": "bandit", "rule": "B608", "severity": "MEDIUM", "file": "a.py", "line": 3, "message": "a | b"}
-    body = app.report([f], ["semgrep: Timeout"])
+    f = {"tool": "bandit", "rule": "B608", "severity": "MEDIUM", "file": "a.py", "line": 3, "message": "sql"}
+    body = app.report([f], {0: {"risk": "a | b", "fix": "use params", "false_positive": True}}, ["semgrep: Timeout"])
     assert body.startswith(app.MARK)
-    assert "a \\| b" in body and "Not run: semgrep" in body
+    assert "(likely false positive) a \\| b" in body and "use params" in body and "Not run: semgrep" in body
+
+
+def test_triage_drops_invented_findings(monkeypatch, tmp_path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    f = {"tool": "bandit", "rule": "B1", "severity": "LOW", "file": "a.py", "line": 1, "message": "m"}
+    fake = {"items": [{"id": 0, "risk": "r", "fix": "x"}, {"id": 99, "risk": "invented"}]}
+
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": json.dumps(fake)}}]}
+
+    monkeypatch.setattr(app, "LLM_KEY", "k")
+    monkeypatch.setattr(app.httpx, "post", lambda *a, **k: Resp())
+    assert list(app.triage(str(tmp_path), [f])) == [0]  # id 99 was never sent, so it's dropped
 
 
 def test_pr_event_schedules_review(monkeypatch):
