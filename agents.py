@@ -72,8 +72,12 @@ def quality_review(patches, standards_text):
                   "RULES:\n" + "\n\n".join(rules[i] for i in picked) + f"\n\nFILE {file}, ADDED LINES:\n" +
                   "\n".join(f"{n}: {text}" for n, text in added.items()))
         for it in llm_json(prompt).get("items", []):
+            try:
+                line = int(it.get("line"))  # models sometimes send "3" instead of 3
+            except (TypeError, ValueError):
+                continue
             # guardrail: only rules we retrieved, only lines this PR added; anything else is dropped
-            if it.get("rule") in picked and it.get("line") in added:
+            if it.get("rule") in picked and line in added:
                 found.append({"tool": "quality", "rule": it["rule"], "severity": "LOW", "file": file,
-                              "line": it["line"], "message": str(it.get("message", "")), "fix": str(it.get("fix", ""))})
+                              "line": line, "message": str(it.get("message", "")), "fix": str(it.get("fix", ""))}) 
     return found
