@@ -24,7 +24,9 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
 SECRET = os.environ.get("WEBHOOK_SECRET", "").encode()
 log = logging.getLogger("uvicorn.error")
 app = FastAPI()
-
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 def valid_signature(raw: bytes, header: str) -> bool:
     if not SECRET:  # no secret configured = reject everything, never accept everything
