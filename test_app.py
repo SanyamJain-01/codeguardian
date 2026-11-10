@@ -2,7 +2,7 @@ import hashlib
 import hmac
 
 from fastapi.testclient import TestClient
-
+import secrets
 import app
 
 
@@ -14,3 +14,27 @@ def test_signature(monkeypatch):
 
     assert client.post("/webhook", content=body, headers={"X-Hub-Signature-256": "sha256=bad"}).status_code == 401
     assert client.post("/webhook", content=body, headers={"X-Hub-Signature-256": good}).status_code == 200
+
+
+
+VULN = '''import sqlite3, subprocess
+def get_user(name):
+    return sqlite3.connect("db").execute("SELECT * FROM users WHERE name = '%s'" % name)
+def run(cmd):
+    return subprocess.call(cmd, shell=True)
+'''
+
+
+def test_scan(tmp_path):
+    (tmp_path / "vuln.py").write_text(VULN)
+    (tmp_path / "config.py").write_text(f'TOKEN = "ghp_{secrets.token_hex(18)}"\n')  # fake token, made at runtime
+    (tmp_path / "untouched.py").write_text(VULN)  # not part of the PR, must be ignored
+
+    found, errors = app.scan(str(tmp_path), ["vuln.py", "config.py"])
+
+    assert errors == [], errors
+    assert {"semgrep", "bandit", "gitleaks"} <= {f["tool"] for f in found}
+    assert all(f["file"] != "untouched.py" for f in found)
+    assert any(f["line"] == 3 for f in found), "SQL injection missed"
+    assert any(f["line"] == 5 for f in found), "shell=True missed"
+    assert len({(f["file"], f["line"]) for f in found}) == len(found), "duplicates not merged"
