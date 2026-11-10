@@ -60,13 +60,19 @@ def semgrep(root, files):
                     x["start"]["line"], x["extra"]["message"]) for x in json.loads(r.stdout)["results"]]
 
 
+def is_test(path):
+    p = Path(path)
+    return p.name.startswith("test_") or p.name.endswith("_test.py") or "tests" in p.parts
+
+
 def bandit(root, files):
     py = [f for f in files if f.endswith(".py")]  # Bandit only understands Python
     if not py:
         return []
     data = json.loads(run(["bandit", "-f", "json", "-q", *py], root).stdout or "{}")
     return [finding("bandit", x["test_id"], x["issue_severity"], x["filename"], x["line_number"],
-                    x["issue_text"]) for x in data.get("results", [])]
+                    x["issue_text"]) for x in data.get("results", [])
+            if not (x["test_id"] == "B101" and is_test(x["filename"]))]  # assert is how tests work
 
 
 def gitleaks(root, files):

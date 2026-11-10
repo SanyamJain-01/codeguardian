@@ -115,3 +115,11 @@ def test_git_errors_never_leak_the_token(monkeypatch):
         assert "ghp_secret" not in str(e) and e.__suppress_context__  # traceback hides the git error
     else:
         raise AssertionError("expected RuntimeError")
+
+
+def test_bandit_allows_assert_in_tests_only(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("def test_a():\n    assert 1\n")
+    (tmp_path / "a.py").write_text("def check(x):\n    assert x\n")
+    found = app.bandit(str(tmp_path), ["tests/test_a.py", "a.py"])
+    assert [(f["file"], f["rule"]) for f in found] == [("a.py", "B101")]
